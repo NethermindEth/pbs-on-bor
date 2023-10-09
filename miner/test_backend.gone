@@ -441,7 +441,7 @@ func (w *worker) mainLoopWithDelay(ctx context.Context, delay uint, opcodeDelay 
 					txs[acc] = append(txs[acc], tx)
 				}
 
-				txset := types.NewTransactionsByPriceAndNonce(w.current.signer, txs, cmath.FromBig(w.current.header.BaseFee))
+				txset := types.NewTransactionsByPriceAndNonce(w.current.signer, txs, nil, nil, cmath.FromBig(w.current.header.BaseFee))
 				tcount := w.current.tcount
 
 				w.commitTransactions(w.current, txset, nil, context.Background())
@@ -675,7 +675,7 @@ func (w *worker) fillTransactionsWithDelay(ctx context.Context, interrupt *int32
 		var txs *types.TransactionsByPriceAndNonce
 
 		tracing.Exec(ctx, "", "worker.LocalTransactionsByPriceAndNonce", func(ctx context.Context, span trace.Span) {
-			txs = types.NewTransactionsByPriceAndNonce(env.signer, localTxs, cmath.FromBig(env.header.BaseFee))
+			txs = types.NewTransactionsByPriceAndNonce(env.signer, localTxs, nil, nil, cmath.FromBig(env.header.BaseFee))
 
 			tracing.SetAttributes(
 				span,
@@ -698,7 +698,7 @@ func (w *worker) fillTransactionsWithDelay(ctx context.Context, interrupt *int32
 		var txs *types.TransactionsByPriceAndNonce
 
 		tracing.Exec(ctx, "", "worker.RemoteTransactionsByPriceAndNonce", func(ctx context.Context, span trace.Span) {
-			txs = types.NewTransactionsByPriceAndNonce(env.signer, remoteTxs, cmath.FromBig(env.header.BaseFee))
+			txs = types.NewTransactionsByPriceAndNonce(env.signer, remoteTxs, nil, nil, cmath.FromBig(env.header.BaseFee))
 
 			tracing.SetAttributes(
 				span,
@@ -795,12 +795,13 @@ mainloop:
 			break
 		}
 		// Retrieve the next transaction and abort if all done
-		tx := txs.Peek()
-		if tx == nil {
+		txmf := txs.Peek()
+		if txmf == nil {
 			// nolint:goconst
 			breakCause = "all transactions has been included"
 			break
 		}
+		tx := txmf.Tx()
 		// Error may be ignored here. The error has already been checked
 		// during transaction acceptance is the transaction pool.
 		//

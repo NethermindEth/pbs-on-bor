@@ -18,8 +18,13 @@
 package miner
 
 import (
+	"crypto/ecdsa"
+	"errors"
 	"fmt"
+	"github.com/ethereum/go-ethereum/crypto"
 	"math/big"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,20 +49,69 @@ type Backend interface {
 	PeerCount() int
 }
 
+type AlgoType int
+
+const (
+	ALGO_MEV_GETH AlgoType = iota
+	ALGO_GREEDY
+	ALGO_GREEDY_BUCKETS
+	ALGO_GREEDY_MULTISNAP
+	ALGO_GREEDY_BUCKETS_MULTISNAP
+)
+
+func (a AlgoType) String() string {
+	switch a {
+	case ALGO_GREEDY:
+		return "greedy"
+	case ALGO_GREEDY_MULTISNAP:
+		return "greedy-multi-snap"
+	case ALGO_MEV_GETH:
+		return "mev-geth"
+	case ALGO_GREEDY_BUCKETS:
+		return "greedy-buckets"
+	case ALGO_GREEDY_BUCKETS_MULTISNAP:
+		return "greedy-buckets-multi-snap"
+	default:
+		return "unsupported"
+	}
+}
+
+func AlgoTypeFlagToEnum(algoString string) (AlgoType, error) {
+	switch strings.ToLower(algoString) {
+	case ALGO_MEV_GETH.String():
+		return ALGO_MEV_GETH, nil
+	case ALGO_GREEDY_BUCKETS.String():
+		return ALGO_GREEDY_BUCKETS, nil
+	case ALGO_GREEDY.String():
+		return ALGO_GREEDY, nil
+	case ALGO_GREEDY_MULTISNAP.String():
+		return ALGO_GREEDY_MULTISNAP, nil
+	case ALGO_GREEDY_BUCKETS_MULTISNAP.String():
+		return ALGO_GREEDY_BUCKETS_MULTISNAP, nil
+	default:
+		return ALGO_MEV_GETH, errors.New("algo not recognized")
+	}
+}
+
 // Config is the configuration parameters of mining.
 type Config struct {
-	Etherbase           common.Address `toml:",omitempty"` // Public address for block mining rewards
-	Notify              []string       `toml:",omitempty"` // HTTP URL list to be notified of new work packages (only useful in ethash).
-	NotifyFull          bool           `toml:",omitempty"` // Notify with pending block headers instead of work packages
-	ExtraData           hexutil.Bytes  `toml:",omitempty"` // Block extra data set by the miner
-	GasFloor            uint64         // Target gas floor for mined blocks.
-	GasCeil             uint64         // Target gas ceiling for mined blocks.
-	GasPrice            *big.Int       // Minimum gas price for mining a transaction
-	Recommit            time.Duration  // The time interval for miner to re-create mining work.
-	Noverify            bool           // Disable remote mining solution verification(only useful in ethash).
-	CommitInterruptFlag bool           // Interrupt commit when time is up ( default = true)
-
-	NewPayloadTimeout time.Duration // The maximum time allowance for creating a new payload
+	Etherbase                common.Address    `toml:",omitempty"` // Public address for block mining rewards
+	Notify                   []string          `toml:",omitempty"` // HTTP URL list to be notified of new work packages (only useful in ethash).
+	NotifyFull               bool              `toml:",omitempty"` // Notify with pending block headers instead of work packages
+	ExtraData                hexutil.Bytes     `toml:",omitempty"` // Block extra data set by the miner
+	GasFloor                 uint64            // Target gas floor for mined blocks.
+	GasCeil                  uint64            // Target gas ceiling for mined blocks.
+	GasPrice                 *big.Int          // Minimum gas price for mining a transaction
+	AlgoType                 AlgoType          // Algorithm to use for block building
+	Recommit                 time.Duration     // The time interval for miner to re-create mining work.
+	Noverify                 bool              // Disable remote mining solution verification(only useful in ethash).
+	CommitInterruptFlag      bool              // Interrupt commit when time is up ( default = true)
+	BuilderTxSigningKey      *ecdsa.PrivateKey `toml:",omitempty"` // Signing key of builder coinbase to make transaction to validator
+	MaxMergedBundles         int
+	Blocklist                []common.Address `toml:",omitempty"`
+	NewPayloadTimeout        time.Duration    // The maximum time allowance for creating a new payload
+	PriceCutoffPercent       int              // Effective gas price cutoff % used for bucketing transactions by price (only useful in greedy-buckets AlgoType)
+	DiscardRevertibleTxOnErr bool             // When enabled, if bundle revertible transaction has error on commit, builder will discard the transaction
 }
 
 // DefaultConfig contains default settings for miner.
@@ -69,8 +123,9 @@ var DefaultConfig = Config{
 	// consensus-layer usually will wait a half slot of time(6s)
 	// for payload generation. It should be enough for Geth to
 	// run 3 rounds.
-	Recommit:          2 * time.Second,
-	NewPayloadTimeout: 2 * time.Second,
+	Recommit:           2 * time.Second,
+	NewPayloadTimeout:  2 * time.Second,
+	PriceCutoffPercent: defaultPriceCutoffPercent,
 }
 
 // Miner creates blocks and searches for proof-of-work values.
@@ -82,20 +137,29 @@ type Miner struct {
 	exitCh  chan struct{}
 	startCh chan struct{}
 	stopCh  chan chan struct{}
-	worker  *worker
+	worker  *multiWorker
 
 	wg sync.WaitGroup
 }
 
 func New(eth Backend, config *Config, chainConfig *params.ChainConfig, mux *event.TypeMux, engine consensus.Engine, isLocalBlock func(header *types.Header) bool) *Miner {
+	if config.BuilderTxSigningKey == nil {
+		key := os.Getenv("BUILDER_TX_SIGNING_KEY")
+		if key, err := crypto.HexToECDSA(strings.TrimPrefix(key, "0x")); err != nil {
+			log.Error("Error parsing builder signing key from env", "err", err)
+		} else {
+			config.BuilderTxSigningKey = key
+		}
+	}
+
 	miner := &Miner{
 		mux:     mux,
 		eth:     eth,
 		engine:  engine,
 		exitCh:  make(chan struct{}),
-		stopCh:  make(chan chan struct{}),
 		startCh: make(chan struct{}),
-		worker:  newWorker(config, chainConfig, engine, eth, mux, isLocalBlock, true),
+		stopCh:  make(chan chan struct{}),
+		worker:  newMultiWorker(config, chainConfig, engine, eth, mux, isLocalBlock, true),
 	}
 	miner.wg.Add(1)
 
@@ -105,7 +169,8 @@ func New(eth Backend, config *Config, chainConfig *params.ChainConfig, mux *even
 }
 
 func (miner *Miner) GetWorker() *worker {
-	return miner.worker
+	// TODO [pnowosie] where is it used?
+	return miner.worker.workers[0] //??
 }
 
 // update keeps track of the downloader events. Please be aware that this is a one shot type of update loop.
@@ -195,7 +260,7 @@ func (miner *Miner) Close() {
 }
 
 func (miner *Miner) Mining() bool {
-	return miner.worker.IsRunning()
+	return miner.worker.isRunning()
 }
 
 func (miner *Miner) Hashrate() uint64 {
@@ -223,7 +288,7 @@ func (miner *Miner) SetRecommitInterval(interval time.Duration) {
 
 // Pending returns the currently pending block and associated state.
 func (miner *Miner) Pending() (*types.Block, *state.StateDB) {
-	return miner.worker.pending()
+	return miner.worker.regularWorker.pending()
 }
 
 // PendingBlock returns the currently pending block.
@@ -232,7 +297,7 @@ func (miner *Miner) Pending() (*types.Block, *state.StateDB) {
 // simultaneously, please use Pending(), as the pending state can
 // change between multiple method calls
 func (miner *Miner) PendingBlock() *types.Block {
-	return miner.worker.pendingBlock()
+	return miner.worker.regularWorker.pendingBlock()
 }
 
 // PendingBlockAndReceipts returns the currently pending block and corresponding receipts.
@@ -270,8 +335,11 @@ func (miner *Miner) DisablePreseal() {
 // SubscribePendingLogs starts delivering logs from pending transactions
 // to the given channel.
 func (miner *Miner) SubscribePendingLogs(ch chan<- []*types.Log) event.Subscription {
-	return miner.worker.pendingLogsFeed.Subscribe(ch)
+	return miner.worker.regularWorker.pendingLogsFeed.Subscribe(ch)
 }
+
+// Accepts the block, time at which orders were taken, bundles which were used to build the block and all bundles that were considered for the block
+type BlockHookFn = func(*types.Block, *big.Int, time.Time, []types.SimulatedBundle, []types.SimulatedBundle, []types.UsedSBundle)
 
 // BuildPayload builds the payload according to the provided parameters.
 func (miner *Miner) BuildPayload(args *BuildPayloadArgs) (*Payload, error) {
