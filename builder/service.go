@@ -200,17 +200,6 @@ func Register(stack *node.Node, backend *eth.Ethereum, cfg *Config) error {
 	// BuilderRateLimitMaxBurst is set to builder.RateLimitBurstDefault by default if not specified
 	limiter := rate.NewLimiter(rate.Every(duration), cfg.BuilderRateLimitMaxBurst)
 
-	var builderRateLimitInterval time.Duration
-	if cfg.BuilderRateLimitResubmitInterval != "" {
-		d, err := time.ParseDuration(cfg.BuilderRateLimitResubmitInterval)
-		if err != nil {
-			return fmt.Errorf("error parsing builder rate limit resubmit interval - %v", err)
-		}
-		builderRateLimitInterval = d
-	} else {
-		builderRateLimitInterval = RateLimitIntervalDefault
-	}
-
 	var submissionOffset time.Duration
 	if offset := cfg.BuilderSubmissionOffset; offset != 0 {
 		if offset < 0 {
@@ -242,19 +231,19 @@ func Register(stack *node.Node, backend *eth.Ethereum, cfg *Config) error {
 	if err != nil {
 		return errors.New("incorrect builder API secret key provided")
 	}
-	proposerPubKey, err := bls.PublicKeyFromBytes(cfg.ProposerPubkey)
+	//proposerPubKey, err := bls.PublicKeyFromBytes(cfg.ProposerPubkey)
 
 	builderArgs := CliqueBuilderArgs{
-		sk:                            builderSk,
+		builderSecretKey:              builderSk,
 		ds:                            ds,
 		eth:                           ethereumService,
 		relay:                         relay,
-		proposerPubkey:                proposerPubKey,
-		builderSigningDomain:          builderSigningDomain,
-		builderBlockResubmitInterval:  builderRateLimitInterval,
 		submissionOffsetFromEndOfSlot: submissionOffset,
 		limiter:                       limiter,
 		validator:                     validator,
+		//proposerPubkey:                proposerPubKey,
+		//builderSigningDomain:          builderSigningDomain,
+		//builderBlockResubmitInterval:  builderRateLimitInterval,
 	}
 
 	builderBackend, err := NewCliqueBuilder(builderArgs)

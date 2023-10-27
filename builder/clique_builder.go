@@ -56,28 +56,28 @@ type CliqueBuilder struct {
 }
 
 type CliqueBuilderArgs struct {
-	sk                            *bls.SecretKey
 	ds                            flashbotsextra.IDatabaseService
 	relay                         IRelay
 	blockTime                     time.Duration
-	proposerPubkey                phase0.BLSPubKey
 	proposerFeeRecipient          bellatrix.ExecutionAddress
 	proposerGasLimit              uint64
-	builderSigningDomain          phase0.Domain
-	builderBlockResubmitInterval  time.Duration
 	eth                           IEthereumService
 	limiter                       *rate.Limiter
 	submissionOffsetFromEndOfSlot time.Duration
 	validator                     *blockvalidation.BlockValidationAPI
+	builderSecretKey              *bls.SecretKey
+	//proposerPubkey                phase0.BLSPubKey
+	//builderSigningDomain          phase0.Domain
+	//builderBlockResubmitInterval  time.Duration
 }
 
 func NewCliqueBuilder(args CliqueBuilderArgs) (*CliqueBuilder, error) {
-	blsPk, err := bls.PublicKeyFromSecretKey(args.sk)
+	blsPk, err := bls.PublicKeyFromSecretKey(args.builderSecretKey)
 	if err != nil {
 		return nil, err
 	}
 
-	pk, err := utils.BlsPublicKeyToPublicKey(blsPk)
+	builderPublicKey, err := utils.BlsPublicKeyToPublicKey(blsPk)
 	if err != nil {
 		return nil, err
 	}
@@ -86,9 +86,9 @@ func NewCliqueBuilder(args CliqueBuilderArgs) (*CliqueBuilder, error) {
 		args.limiter = rate.NewLimiter(rate.Every(RateLimitIntervalDefault), RateLimitBurstDefault)
 	}
 
-	if args.builderBlockResubmitInterval == 0 {
-		args.builderBlockResubmitInterval = BlockResubmitIntervalDefault
-	}
+	//if args.builderBlockResubmitInterval == 0 {
+	//	args.builderBlockResubmitInterval = BlockResubmitIntervalDefault
+	//}
 
 	if args.submissionOffsetFromEndOfSlot == 0 {
 		args.submissionOffsetFromEndOfSlot = SubmissionOffsetFromEndOfSlotSecondsDefault
@@ -100,26 +100,25 @@ func NewCliqueBuilder(args CliqueBuilderArgs) (*CliqueBuilder, error) {
 		ds:                            args.ds,
 		relay:                         args.relay,
 		eth:                           args.eth,
-		proposerPubkey:                args.proposerPubkey,
 		proposerFeeRecipient:          args.proposerFeeRecipient,
 		proposerGasLimit:              args.proposerGasLimit,
-		builderSecretKey:              args.sk,
-		builderPublicKey:              pk,
-		builderSigningDomain:          args.builderSigningDomain,
-		builderResubmitInterval:       args.builderBlockResubmitInterval,
 		submissionOffsetFromEndOfSlot: args.submissionOffsetFromEndOfSlot,
 		limiter:                       args.limiter,
 		slotCtx:                       slotCtx,
 		slotCtxCancel:                 slotCtxCancel,
 		stop:                          make(chan struct{}, 1),
+		builderPublicKey:              builderPublicKey,
+		builderSecretKey:              args.builderSecretKey,
+		//proposerPubkey:                args.proposerPubkey,
+		//builderSigningDomain:          args.builderSigningDomain,
+		//builderResubmitInterval:       args.builderBlockResubmitInterval,
 	}, nil
 }
 
 func (cb *CliqueBuilder) Start() error {
 	go func() {
 		c := make(chan core.ChainHeadEvent)
-		//TODO: How to connect to Bor server?
-		//cb.eth.BlockChain().SubscribeChainHeadEvent(c)
+		cb.eth.BlockChain().SubscribeChainHeadEvent(c)
 		for {
 			select {
 			case <-cb.stop:

@@ -24,6 +24,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/accounts/keystore"
+	"github.com/ethereum/go-ethereum/builder"
 	"github.com/ethereum/go-ethereum/cmd/utils"
 	"github.com/ethereum/go-ethereum/consensus/beacon" //nolint:typecheck
 	"github.com/ethereum/go-ethereum/consensus/bor"    //nolint:typecheck
@@ -274,6 +275,12 @@ func NewServer(config *Config, opts ...serverOption) (*Server, error) {
 	// sealing (if enabled) or in dev mode
 	if config.Sealer.Enabled || config.Developer.Enabled {
 		if err := srv.backend.StartMining(1); err != nil {
+			return nil, err
+		}
+	}
+
+	if config.Builder.Enabled {
+		if err := builder.Register(stack, srv.backend, config.Builder); err != nil {
 			return nil, err
 		}
 	}

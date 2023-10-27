@@ -22,6 +22,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/accounts/keystore"
+	"github.com/ethereum/go-ethereum/builder"
 	"github.com/ethereum/go-ethereum/cmd/utils"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/fdlimit"
@@ -140,6 +141,9 @@ type Config struct {
 
 	// Pprof has the pprof related settings
 	Pprof *PprofConfig `hcl:"pprof,block" toml:"pprof,block"`
+
+	// Flashbots builder
+	Builder *builder.Config `hcl:"builder,block" toml:"builder,block"`
 }
 
 type LoggingConfig struct {
@@ -595,6 +599,7 @@ type ParallelEVMConfig struct {
 }
 
 func DefaultConfig() *Config {
+	builderCfg := builder.DefaultConfig
 	return &Config{
 		Chain:                   "mainnet",
 		Identity:                Hostname(),
@@ -787,6 +792,7 @@ func DefaultConfig() *Config {
 			Enable:               true,
 			SpeculativeProcesses: 8,
 		},
+		Builder: &builderCfg,
 	}
 }
 
