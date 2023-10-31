@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"math"
 	"math/big"
 	"sort"
@@ -42,6 +43,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/params"
+	"golang.org/x/crypto/sha3"
 )
 
 const (
@@ -104,8 +106,9 @@ var (
 )
 
 var (
-	evictionInterval    = time.Minute     // Time interval to check for evictable transactions
-	statsReportInterval = 8 * time.Second // Time interval to report transaction pool stats
+	evictionInterval         = time.Minute     // Time interval to check for evictable transactions
+	statsReportInterval      = 8 * time.Second // Time interval to report transaction pool stats
+	privateTxCleanupInterval = 1 * time.Hour
 )
 
 var (
@@ -188,6 +191,9 @@ type Config struct {
 
 	Lifetime            time.Duration // Maximum amount of time non-executable transaction are queued
 	AllowUnprotectedTxs bool          // Allow non-EIP-155 transactions
+	PrivateTxLifetime   time.Duration // Maximum amount of time to keep private transactions private
+
+	TrustedRelays []common.Address // Trusted relay addresses. Duplicated from the miner config.
 }
 
 // DefaultConfig contains the default configurations for the transaction
@@ -206,6 +212,7 @@ var DefaultConfig = Config{
 
 	Lifetime:            3 * time.Hour,
 	AllowUnprotectedTxs: false,
+	PrivateTxLifetime:   3 * 24 * time.Hour,
 }
 
 // sanitize checks the provided user configurations and changes anything that's
@@ -251,7 +258,10 @@ func (config *Config) sanitize() Config {
 		log.Warn("Sanitizing invalid txpool lifetime", "provided", conf.Lifetime, "updated", DefaultConfig.Lifetime)
 		conf.Lifetime = DefaultConfig.Lifetime
 	}
-
+	if conf.PrivateTxLifetime < 1 {
+		log.Warn("Sanitizing invalid txpool private tx lifetime", "provided", conf.PrivateTxLifetime, "updated", DefaultConfig.PrivateTxLifetime)
+		conf.PrivateTxLifetime = DefaultConfig.PrivateTxLifetime
+	}
 	return conf
 }
 
@@ -308,6 +318,11 @@ type TxPool struct {
 	changesSinceReorg int // A counter for how many drops we've performed in-between reorg.
 
 	promoteTxCh chan struct{} // should be used only for tests
+
+	privateTxs    *timestampedTxHashSet
+	mevBundles    []types.MevBundle
+	bundleFetcher IFetcher
+	sbundles      *SBundlePool
 }
 
 type txpoolResetRequest struct {
@@ -339,6 +354,8 @@ func NewTxPool(config Config, chainconfig *params.ChainConfig, chain blockChain,
 		initDoneCh:      make(chan struct{}),
 		gasPrice:        new(big.Int).SetUint64(config.PriceLimit),
 		gasPriceUint:    uint256.NewInt(config.PriceLimit),
+		privateTxs:      newExpiringTxHashSet(config.PrivateTxLifetime),
+		sbundles:        NewSBundlePool(types.LatestSigner(chainconfig)),
 	}
 
 	pool.locals = newAccountSet(pool.signer)
@@ -382,6 +399,17 @@ func NewTxPool(config Config, chainconfig *params.ChainConfig, chain blockChain,
 	return pool
 }
 
+type IFetcher interface {
+	GetLatestUuidBundles(ctx context.Context, blockNum int64) ([]types.LatestUuidBundle, error)
+}
+
+func (pool *TxPool) RegisterBundleFetcher(fetcher IFetcher) {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	pool.bundleFetcher = fetcher
+}
+
 // loop is the transaction pool's main event loop, waiting for and reacting to
 // outside blockchain events as well as for various reporting and transaction
 // eviction events.
@@ -391,9 +419,10 @@ func (pool *TxPool) loop() {
 	var (
 		prevPending, prevQueued, prevStales int
 		// Start the stats reporting and transaction eviction tickers
-		report  = time.NewTicker(statsReportInterval)
-		evict   = time.NewTicker(evictionInterval)
-		journal = time.NewTicker(pool.config.Rejournal)
+		report    = time.NewTicker(statsReportInterval)
+		evict     = time.NewTicker(evictionInterval)
+		journal   = time.NewTicker(pool.config.Rejournal)
+		privateTx = time.NewTicker(privateTxCleanupInterval)
 		// Track the previous head headers for transaction reorgs
 		head = pool.chain.CurrentBlock()
 	)
@@ -401,6 +430,7 @@ func (pool *TxPool) loop() {
 	defer report.Stop()
 	defer evict.Stop()
 	defer journal.Stop()
+	defer privateTx.Stop()
 
 	// Notify tests that the init phase is done
 	close(pool.initDoneCh)
@@ -480,6 +510,10 @@ func (pool *TxPool) loop() {
 				}
 				pool.mu.Unlock()
 			}
+
+			// Remove stale hashes that must be kept private
+		case <-privateTx.C:
+			pool.privateTxs.prune()
 		}
 	}
 }
@@ -638,6 +672,11 @@ func (pool *TxPool) ContentFrom(addr common.Address) (types.Transactions, types.
 	return pending, queued
 }
 
+// IsPrivateTxHash indicates whether the transaction should be shared with peers
+func (pool *TxPool) IsPrivateTxHash(hash common.Hash) bool {
+	return pool.privateTxs.Contains(hash)
+}
+
 // Pending retrieves all currently processable transactions, grouped by origin
 // account and sorted by nonce. The returned transaction set is a copy and can be
 // freely modified by calling code.
@@ -709,6 +748,177 @@ func (pool *TxPool) Pending(ctx context.Context, enforceTips bool) map[common.Ad
 	})
 
 	return pending
+}
+
+type uuidBundleKey struct {
+	Uuid           uuid.UUID
+	SigningAddress common.Address
+}
+
+func (pool *TxPool) fetchLatestCancellableBundles(ctx context.Context, blockNumber *big.Int) (chan []types.LatestUuidBundle, chan error) {
+	if pool.bundleFetcher == nil {
+		return nil, nil
+	}
+	errCh := make(chan error, 1)
+	lubCh := make(chan []types.LatestUuidBundle, 1)
+	go func(blockNum int64) {
+		lub, err := pool.bundleFetcher.GetLatestUuidBundles(ctx, blockNum)
+		errCh <- err
+		lubCh <- lub
+	}(blockNumber.Int64())
+	return lubCh, errCh
+}
+
+func resolveCancellableBundles(lubCh chan []types.LatestUuidBundle, errCh chan error, uuidBundles map[uuidBundleKey][]types.MevBundle) []types.MevBundle {
+	if lubCh == nil || errCh == nil {
+		return nil
+	}
+
+	if len(uuidBundles) == 0 {
+		return nil
+	}
+
+	err := <-errCh
+	if err != nil {
+		log.Error("could not fetch latest bundles uuid map", "err", err)
+		return nil
+	}
+
+	currentCancellableBundles := []types.MevBundle{}
+
+	log.Trace("Processing uuid bundles", "uuidBundles", uuidBundles)
+
+	lubs := <-lubCh
+LubLoop:
+	for _, lub := range lubs {
+		ubk := uuidBundleKey{lub.Uuid, lub.SigningAddress}
+		bundles, found := uuidBundles[ubk]
+		if !found {
+			log.Trace("missing uuid bundle", "ubk", ubk)
+			continue
+		}
+
+		// If lub has bundle_uuid set, and we can find corresponding bundle we prefer it, if not we fallback to bundle_hash equivalence
+		if lub.BundleUUID != types.EmptyUUID {
+			for _, bundle := range bundles {
+				if bundle.ComputeUUID() == lub.BundleUUID {
+					log.Trace("adding uuid bundle", "bundle hash", bundle.Hash.String(), "lub", lub)
+					currentCancellableBundles = append(currentCancellableBundles, bundle)
+					continue LubLoop
+				}
+			}
+		}
+
+		for _, bundle := range bundles {
+			if bundle.Hash == lub.BundleHash {
+				log.Trace("adding uuid bundle", "bundle hash", bundle.Hash.String(), "lub", lub)
+				currentCancellableBundles = append(currentCancellableBundles, bundle)
+				break
+			}
+		}
+	}
+	return currentCancellableBundles
+}
+
+// MevBundles returns a list of bundles valid for the given blockNumber/blockTimestamp
+// also prunes bundles that are outdated
+// Returns regular bundles and a function resolving to current cancellable bundles
+func (pool *TxPool) MevBundles(blockNumber *big.Int, blockTimestamp uint64) ([]types.MevBundle, chan []types.MevBundle) {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	lubCh, errCh := pool.fetchLatestCancellableBundles(ctx, blockNumber)
+
+	// returned values
+	var ret []types.MevBundle
+	// rolled over values
+	var bundles []types.MevBundle
+	// (uuid, signingAddress) -> list of bundles
+	var uuidBundles = make(map[uuidBundleKey][]types.MevBundle)
+
+	for _, bundle := range pool.mevBundles {
+		// Prune outdated bundles
+		if (bundle.MaxTimestamp != 0 && blockTimestamp > bundle.MaxTimestamp) || blockNumber.Cmp(bundle.BlockNumber) > 0 {
+			continue
+		}
+
+		// Roll over future bundles
+		if (bundle.MinTimestamp != 0 && blockTimestamp < bundle.MinTimestamp) || blockNumber.Cmp(bundle.BlockNumber) < 0 {
+			bundles = append(bundles, bundle)
+			continue
+		}
+
+		// keep the bundles around internally until they need to be pruned
+		bundles = append(bundles, bundle)
+
+		// TODO: omit duplicates
+
+		// do not append to the return quite yet, check the DB for the latest bundle for that uuid
+		if bundle.Uuid != types.EmptyUUID {
+			ubk := uuidBundleKey{bundle.Uuid, bundle.SigningAddress}
+			uuidBundles[ubk] = append(uuidBundles[ubk], bundle)
+			continue
+		}
+
+		// return the ones which are in time
+		ret = append(ret, bundle)
+	}
+
+	pool.mevBundles = bundles
+
+	cancellableBundlesCh := make(chan []types.MevBundle, 1)
+	go func() {
+		cancellableBundlesCh <- resolveCancellableBundles(lubCh, errCh, uuidBundles)
+		cancel()
+	}()
+
+	return ret, cancellableBundlesCh
+}
+
+// AddMevBundles adds a mev bundles to the pool
+func (pool *TxPool) AddMevBundles(mevBundles []types.MevBundle) error {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	pool.mevBundles = append(pool.mevBundles, mevBundles...)
+	return nil
+}
+
+// AddMevBundle adds a mev bundle to the pool
+func (pool *TxPool) AddMevBundle(txs types.Transactions, blockNumber *big.Int, replacementUuid uuid.UUID, signingAddress common.Address, minTimestamp, maxTimestamp uint64, revertingTxHashes []common.Hash) error {
+	bundleHasher := sha3.NewLegacyKeccak256()
+	for _, tx := range txs {
+		bundleHasher.Write(tx.Hash().Bytes())
+	}
+	bundleHash := common.BytesToHash(bundleHasher.Sum(nil))
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	pool.mevBundles = append(pool.mevBundles, types.MevBundle{
+		Txs:               txs,
+		BlockNumber:       blockNumber,
+		Uuid:              replacementUuid,
+		SigningAddress:    signingAddress,
+		MinTimestamp:      minTimestamp,
+		MaxTimestamp:      maxTimestamp,
+		RevertingTxHashes: revertingTxHashes,
+		Hash:              bundleHash,
+	})
+	return nil
+}
+
+func (pool *TxPool) AddSBundle(bundle *types.SBundle) error {
+	return pool.sbundles.Add(bundle)
+}
+
+func (pool *TxPool) CancelSBundles(hashes []common.Hash) {
+	pool.sbundles.Cancel(hashes)
+}
+
+func (pool *TxPool) GetSBundles(block *big.Int) []*types.SBundle {
+	return pool.sbundles.GetSBundles(block.Uint64())
 }
 
 // Locals retrieves the accounts currently considered local by the pool.
@@ -1176,13 +1386,14 @@ func (pool *TxPool) promoteTx(addr common.Address, hash common.Hash, tx *types.T
 // This method is used to add transactions from the RPC API and performs synchronous pool
 // reorganization and event propagation.
 func (pool *TxPool) AddLocals(txs []*types.Transaction) []error {
-	return pool.addTxs(txs, !pool.config.NoLocals, true)
+	return pool.addTxs(txs, !pool.config.NoLocals, true, false)
 }
 
 // AddLocal enqueues a single local transaction into the pool if it is valid. This is
 // a convenience wrapper around AddLocals.
 func (pool *TxPool) AddLocal(tx *types.Transaction) error {
-	return pool.addTx(tx, !pool.config.NoLocals, true)
+	errs := pool.AddLocals([]*types.Transaction{tx})
+	return errs[0]
 }
 
 // AddRemotes enqueues a batch of transactions into the pool if they are valid. If the
@@ -1191,16 +1402,22 @@ func (pool *TxPool) AddLocal(tx *types.Transaction) error {
 // This method is used to add transactions from the p2p network and does not wait for pool
 // reorganization and internal event propagation.
 func (pool *TxPool) AddRemotes(txs []*types.Transaction) []error {
-	return pool.addTxs(txs, false, false)
+	return pool.addTxs(txs, false, false, false)
+}
+
+// AddPrivateRemote adds transactions to the pool, but does not broadcast these transactions to any peers.
+func (pool *TxPool) AddPrivateRemote(tx *types.Transaction) error {
+	errs := pool.addTxs([]*types.Transaction{tx}, false, false, true)
+	return errs[0]
 }
 
 // AddRemotesSync is like AddRemotes, but waits for pool reorganization. Tests use this method.
 func (pool *TxPool) AddRemotesSync(txs []*types.Transaction) []error {
-	return pool.addTxs(txs, false, true)
+	return pool.addTxs(txs, false, true, false)
 }
 
-func (pool *TxPool) AddRemoteSync(txs *types.Transaction) error {
-	return pool.addTx(txs, false, true)
+func (pool *TxPool) AddRemoteSync(tx *types.Transaction) error {
+	return pool.addRemoteSync(tx)
 }
 
 // This is like AddRemotes with a single transaction, but waits for pool reorganization. Tests use this method.
@@ -1217,7 +1434,7 @@ func (pool *TxPool) AddRemote(tx *types.Transaction) error {
 }
 
 // addTxs attempts to queue a batch of transactions if they are valid.
-func (pool *TxPool) addTxs(txs []*types.Transaction, local, sync bool) []error {
+func (pool *TxPool) addTxs(txs []*types.Transaction, local, sync bool, private bool) []error {
 	// Filter out known ones without obtaining the pool lock or recovering signatures
 	var (
 		errs = make([]error, len(txs))
@@ -1262,6 +1479,13 @@ func (pool *TxPool) addTxs(txs []*types.Transaction, local, sync bool) []error {
 		return errs
 	}
 
+	// Track private transactions, so they don't get leaked to the public mempool
+	if private {
+		for _, tx := range news {
+			pool.privateTxs.Add(tx.Hash())
+		}
+	}
+
 	// Process all the new transaction and merge any errors into the original slice
 	pool.mu.Lock()
 	newErrs, dirtyAddrs := pool.addTxsLocked(news, local)
@@ -1287,59 +1511,59 @@ func (pool *TxPool) addTxs(txs []*types.Transaction, local, sync bool) []error {
 }
 
 // addTxs attempts to queue a batch of transactions if they are valid.
-func (pool *TxPool) addTx(tx *types.Transaction, local, sync bool) error {
-	// Filter out known ones without obtaining the pool lock or recovering signatures
-	var (
-		err  error
-		hash common.Hash
-	)
-
-	func() {
-		// If the transaction is known, pre-set the error slot
-		hash = tx.Hash()
-
-		if pool.all.Get(hash) != nil {
-			err = ErrAlreadyKnown
-
-			knownTxMeter.Mark(1)
-
-			return
-		}
-
-		// Exclude transactions with invalid signatures as soon as
-		// possible and cache senders in transactions before
-		// obtaining lock
-		if pool.config.AllowUnprotectedTxs {
-			pool.signer = types.NewFakeSigner(tx.ChainId())
-		}
-
-		_, err = types.Sender(pool.signer, tx)
-		if err != nil {
-			invalidTxMeter.Mark(1)
-
-			return
-		}
-	}()
-
-	if err != nil {
-		return err
-	}
-
-	var dirtyAddrs *accountSet
-
-	// Process all the new transaction and merge any errors into the original slice
-	pool.mu.Lock()
-	err, dirtyAddrs = pool.addTxLocked(tx, local)
-	pool.mu.Unlock()
-
-	// Reorg the pool internals if needed and return
-	done := pool.requestPromoteExecutables(dirtyAddrs)
-	if sync {
-		<-done
-	}
-
-	return err
-}
+//func (pool *TxPool) addTx(tx *types.Transaction, local, sync bool) error {
+//	// Filter out known ones without obtaining the pool lock or recovering signatures
+//	var (
+//		err  error
+//		hash common.Hash
+//	)
+//
+//	func() {
+//		// If the transaction is known, pre-set the error slot
+//		hash = tx.Hash()
+//
+//		if pool.all.Get(hash) != nil {
+//			err = ErrAlreadyKnown
+//
+//			knownTxMeter.Mark(1)
+//
+//			return
+//		}
+//
+//		// Exclude transactions with invalid signatures as soon as
+//		// possible and cache senders in transactions before
+//		// obtaining lock
+//		if pool.config.AllowUnprotectedTxs {
+//			pool.signer = types.NewFakeSigner(tx.ChainId())
+//		}
+//
+//		_, err = types.Sender(pool.signer, tx)
+//		if err != nil {
+//			invalidTxMeter.Mark(1)
+//
+//			return
+//		}
+//	}()
+//
+//	if err != nil {
+//		return err
+//	}
+//
+//	var dirtyAddrs *accountSet
+//
+//	// Process all the new transaction and merge any errors into the original slice
+//	pool.mu.Lock()
+//	err, dirtyAddrs = pool.addTxLocked(tx, local)
+//	pool.mu.Unlock()
+//
+//	// Reorg the pool internals if needed and return
+//	done := pool.requestPromoteExecutables(dirtyAddrs)
+//	if sync {
+//		<-done
+//	}
+//
+//	return err
+//}
 
 // addTxsLocked attempts to queue a batch of transactions if they are valid.
 // The transaction pool lock must be held.
@@ -1790,9 +2014,12 @@ func (pool *TxPool) runReorg(ctx context.Context, done chan struct{}, reset *txp
 				var txs []*types.Transaction
 
 				for _, set := range events {
-					txs = append(txs, set.Flatten()...)
+					for _, tx := range set.Flatten() {
+						if !pool.IsPrivateTxHash(tx.Hash()) {
+							txs = append(txs, tx)
+						}
+					}
 				}
-
 				pool.txFeed.Send(core.NewTxsEvent{Txs: txs})
 			})
 		}
@@ -1901,6 +2128,7 @@ func (pool *TxPool) reset(oldHead, newHead *types.Header) {
 	pool.eip2718.Store(pool.chainconfig.IsBerlin(next))
 	pool.eip1559.Store(pool.chainconfig.IsLondon(next))
 	pool.shanghai.Store(pool.chainconfig.IsShanghai(uint64(time.Now().Unix())))
+	pool.sbundles.ResetPoolData(pool)
 }
 
 // promoteExecutables moves transactions that have become processable from the
@@ -2278,6 +2506,7 @@ func (pool *TxPool) demoteUnexecutables() {
 		for _, tx := range olds {
 			hash = tx.Hash()
 			pool.all.Remove(hash)
+			pool.privateTxs.Remove(hash)
 			log.Trace("Removed old pending transaction", "hash", hash)
 		}
 
@@ -2645,6 +2874,60 @@ func (t *lookup) RemotesBelowTip(threshold *big.Int) types.Transactions {
 	}, false, true) // Only iterate remotes
 
 	return found
+}
+
+type timestampedTxHashSet struct {
+	lock       sync.RWMutex
+	timestamps map[common.Hash]time.Time
+	ttl        time.Duration
+}
+
+func newExpiringTxHashSet(ttl time.Duration) *timestampedTxHashSet {
+	s := &timestampedTxHashSet{
+		timestamps: make(map[common.Hash]time.Time),
+		ttl:        ttl,
+	}
+
+	return s
+}
+
+func (s *timestampedTxHashSet) Add(hash common.Hash) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	_, ok := s.timestamps[hash]
+	if !ok {
+		s.timestamps[hash] = time.Now().Add(s.ttl)
+	}
+}
+
+func (s *timestampedTxHashSet) Contains(hash common.Hash) bool {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	_, ok := s.timestamps[hash]
+	return ok
+}
+
+func (s *timestampedTxHashSet) Remove(hash common.Hash) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	_, ok := s.timestamps[hash]
+	if ok {
+		delete(s.timestamps, hash)
+	}
+}
+
+func (s *timestampedTxHashSet) prune() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	now := time.Now()
+	for hash, ts := range s.timestamps {
+		if ts.Before(now) {
+			delete(s.timestamps, hash)
+		}
+	}
 }
 
 // numSlots calculates the number of slots needed for a single transaction.

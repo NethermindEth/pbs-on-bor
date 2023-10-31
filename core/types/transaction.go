@@ -19,9 +19,13 @@ package types
 import (
 	"bytes"
 	"container/heap"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
+	"github.com/google/uuid"
 	"io"
 	"math/big"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -620,10 +624,90 @@ func (s TxByNonce) Len() int           { return len(s) }
 func (s TxByNonce) Less(i, j int) bool { return s[i].Nonce() < s[j].Nonce() }
 func (s TxByNonce) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
+type _Order interface {
+	AsTx() *Transaction
+	AsBundle() *SimulatedBundle
+	AsSBundle() *SimSBundle
+}
+
+type _TxOrder struct {
+	tx *Transaction
+}
+
+func (o _TxOrder) AsTx() *Transaction         { return o.tx }
+func (o _TxOrder) AsBundle() *SimulatedBundle { return nil }
+func (o _TxOrder) AsSBundle() *SimSBundle     { return nil }
+
+type _BundleOrder struct {
+	bundle *SimulatedBundle
+}
+
+func (o _BundleOrder) AsTx() *Transaction         { return nil }
+func (o _BundleOrder) AsBundle() *SimulatedBundle { return o.bundle }
+func (o _BundleOrder) AsSBundle() *SimSBundle     { return nil }
+
+type _SBundleOrder struct {
+	sbundle *SimSBundle
+}
+
+func (o _SBundleOrder) AsTx() *Transaction         { return nil }
+func (o _SBundleOrder) AsBundle() *SimulatedBundle { return nil }
+func (o _SBundleOrder) AsSBundle() *SimSBundle     { return o.sbundle }
+
 // TxWithMinerFee wraps a transaction with its gas price or effective miner gasTipCap
 type TxWithMinerFee struct {
-	tx       *Transaction
-	minerFee *uint256.Int
+	order    _Order
+	minerFee *big.Int
+}
+
+func (t *TxWithMinerFee) Tx() *Transaction {
+	return t.order.AsTx()
+}
+
+func (t *TxWithMinerFee) Bundle() *SimulatedBundle {
+	return t.order.AsBundle()
+}
+
+func (t *TxWithMinerFee) SBundle() *SimSBundle {
+	return t.order.AsSBundle()
+}
+
+func (t *TxWithMinerFee) Price() *big.Int {
+	return new(big.Int).Set(t.minerFee)
+}
+
+func (t *TxWithMinerFee) Profit(baseFee *big.Int, gasUsed uint64) *big.Int {
+	if tx := t.Tx(); tx != nil {
+		profit := new(big.Int).Sub(tx.GasPrice(), baseFee)
+		if gasUsed != 0 {
+			profit.Mul(profit, new(big.Int).SetUint64(gasUsed))
+		} else {
+			profit.Mul(profit, new(big.Int).SetUint64(tx.Gas()))
+		}
+		return profit
+	} else if bundle := t.Bundle(); bundle != nil {
+		return bundle.EthSentToCoinbase
+	} else if sbundle := t.SBundle(); sbundle != nil {
+		return sbundle.Profit
+	} else {
+		panic("profit called on unsupported order type")
+	}
+}
+
+// SetPrice sets the miner fee of the wrapped transaction.
+func (t *TxWithMinerFee) SetPrice(price *big.Int) {
+	t.minerFee.Set(price)
+}
+
+// SetProfit sets the profit of the wrapped transaction.
+func (t *TxWithMinerFee) SetProfit(profit *big.Int) {
+	if bundle := t.Bundle(); bundle != nil {
+		bundle.TotalEth.Set(profit)
+	} else if sbundle := t.SBundle(); sbundle != nil {
+		sbundle.Profit.Set(profit)
+	} else {
+		panic("SetProfit called on unsupported order type")
+	}
 }
 
 // NewTxWithMinerFee creates a wrapped transaction, calculating the effective
@@ -636,7 +720,25 @@ func NewTxWithMinerFee(tx *Transaction, baseFee *uint256.Int) (*TxWithMinerFee, 
 	}
 
 	return &TxWithMinerFee{
-		tx:       tx,
+		order:    _TxOrder{tx},
+		minerFee: minerFee.ToBig(),
+	}, nil
+}
+
+// NewBundleWithMinerFee creates a wrapped bundle.
+func NewBundleWithMinerFee(bundle *SimulatedBundle, _ *big.Int) (*TxWithMinerFee, error) {
+	minerFee := bundle.MevGasPrice
+	return &TxWithMinerFee{
+		order:    _BundleOrder{bundle},
+		minerFee: minerFee,
+	}, nil
+}
+
+// NewSBundleWithMinerFee creates a wrapped bundle.
+func NewSBundleWithMinerFee(sbundle *SimSBundle, _ *big.Int) (*TxWithMinerFee, error) {
+	minerFee := sbundle.MevGasPrice
+	return &TxWithMinerFee{
+		order:    _SBundleOrder{sbundle},
 		minerFee: minerFee,
 	}, nil
 }
@@ -651,9 +753,16 @@ func (s TxByPriceAndTime) Less(i, j int) bool {
 	// deterministic sorting
 	cmp := s[i].minerFee.Cmp(s[j].minerFee)
 	if cmp == 0 {
-		return s[i].tx.time.Before(s[j].tx.time)
-	}
+		if s[i].Tx() != nil && s[j].Tx() != nil {
+			return s[i].Tx().time.Before(s[j].Tx().time)
+		} else if s[i].Bundle() != nil && s[j].Bundle() != nil {
+			return s[i].Bundle().TotalGasUsed <= s[j].Bundle().TotalGasUsed
+		} else if s[i].Bundle() != nil {
+			return false
+		}
 
+		return true
+	}
 	return cmp > 0
 }
 func (s TxByPriceAndTime) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
@@ -687,39 +796,25 @@ type TransactionsByPriceAndNonce struct {
 //
 // Note, the input map is reowned so the caller should not interact any more with
 // if after providing it to the constructor.
-/*
-func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transactions, baseFee *big.Int) *TransactionsByPriceAndNonce {
+func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transactions, bundles []SimulatedBundle, sbundles []*SimSBundle, baseFee *uint256.Int) *TransactionsByPriceAndNonce {
 	// Initialize a price and received time based heap with the head transactions
-	heads := make(TxByPriceAndTime, 0, len(txs))
-	for from, accTxs := range txs {
-		if len(accTxs) == 0 {
-			continue
-		}
+	heads := make(TxByPriceAndTime, 0, len(txs)+len(bundles)+len(sbundles))
 
-		acc, _ := Sender(signer, accTxs[0])
-		wrapped, err := NewTxWithMinerFee(accTxs[0], baseFee)
-		// Remove transaction if sender doesn't match from, or if wrapping fails.
-		if acc != from || err != nil {
-			delete(txs, from)
+	for i := range sbundles {
+		wrapped, err := NewSBundleWithMinerFee(sbundles[i], baseFee.ToBig())
+		if err != nil {
 			continue
 		}
 		heads = append(heads, wrapped)
-		txs[from] = accTxs[1:]
 	}
-	heap.Init(&heads)
 
-	// Assemble and return the transaction set
-	return &TransactionsByPriceAndNonce{
-		txs:     txs,
-		heads:   heads,
-		signer:  signer,
-		baseFee: baseFee,
+	for i := range bundles {
+		wrapped, err := NewBundleWithMinerFee(&bundles[i], baseFee.ToBig())
+		if err != nil {
+			continue
+		}
+		heads = append(heads, wrapped)
 	}
-}*/
-
-func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transactions, baseFee *uint256.Int) *TransactionsByPriceAndNonce {
-	// Initialize a price and received time based heap with the head transactions
-	heads := make(TxByPriceAndTime, 0, len(txs))
 
 	for from, accTxs := range txs {
 		if len(accTxs) == 0 {
@@ -750,28 +845,71 @@ func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transa
 	}
 }
 
+func (t *TransactionsByPriceAndNonce) DeepCopy() *TransactionsByPriceAndNonce {
+	newT := &TransactionsByPriceAndNonce{
+		txs:     make(map[common.Address]Transactions),
+		heads:   append(TxByPriceAndTime{}, t.heads...),
+		signer:  t.signer,
+		baseFee: t.baseFee.Clone(),
+	}
+	for k, v := range t.txs {
+		newT.txs[k] = v
+	}
+	return newT
+}
+
 // Peek returns the next transaction by price.
-func (t *TransactionsByPriceAndNonce) Peek() *Transaction {
+func (t *TransactionsByPriceAndNonce) Peek() *TxWithMinerFee {
 	if len(t.heads) == 0 {
 		return nil
 	}
 
-	return t.heads[0].tx
+	return t.heads[0]
 }
 
 // Shift replaces the current best head with the next one from the same account.
 func (t *TransactionsByPriceAndNonce) Shift() {
-	acc, _ := Sender(t.signer, t.heads[0].tx)
-	if txs, ok := t.txs[acc]; ok && len(txs) > 0 {
-		if wrapped, err := NewTxWithMinerFee(txs[0], t.baseFee); err == nil {
-			t.heads[0], t.txs[acc] = wrapped, txs[1:]
-			heap.Fix(&t.heads, 0)
+	if tx := t.heads[0].Tx(); tx != nil {
+		acc, _ := Sender(t.signer, tx)
+		if txs, ok := t.txs[acc]; ok && len(txs) > 0 {
+			if wrapped, err := NewTxWithMinerFee(txs[0], t.baseFee); err == nil {
+				t.heads[0], t.txs[acc] = wrapped, txs[1:]
+				heap.Fix(&t.heads, 0)
 
-			return
+				return
+			}
 		}
 	}
 
 	heap.Pop(&t.heads)
+}
+
+// ShiftAndPushByAccountForTx attempts to update the transaction list associated with a given account address
+// based on the input transaction account. If the associated account exists and has additional transactions,
+// the top of the transaction list is popped and pushed to the heap.
+// Note that this operation should only be performed when the head transaction on the heap is different from the
+// input transaction. This operation is useful in scenarios where the current best head transaction for an account
+// was already popped from the heap and we want to process the next one from the same account.
+func (t *TransactionsByPriceAndNonce) ShiftAndPushByAccountForTx(tx *Transaction) {
+	if tx == nil {
+		return
+	}
+
+	acc, _ := Sender(t.signer, tx)
+	if txs, exists := t.txs[acc]; exists && len(txs) > 0 {
+		if wrapped, err := NewTxWithMinerFee(txs[0], t.baseFee); err == nil {
+			t.txs[acc] = txs[1:]
+			heap.Push(&t.heads, wrapped)
+		}
+	}
+}
+
+func (t *TransactionsByPriceAndNonce) Push(tx *TxWithMinerFee) {
+	if tx == nil {
+		return
+	}
+
+	heap.Push(&t.heads, tx)
 }
 
 func (t *TransactionsByPriceAndNonce) GetTxs() int {
@@ -794,4 +932,58 @@ func copyAddressPtr(a *common.Address) *common.Address {
 	cpy := *a
 
 	return &cpy
+}
+
+var EmptyUUID uuid.UUID
+
+type LatestUuidBundle struct {
+	Uuid           uuid.UUID
+	SigningAddress common.Address
+	BundleHash     common.Hash
+	BundleUUID     uuid.UUID
+}
+
+type MevBundle struct {
+	Txs               Transactions
+	BlockNumber       *big.Int
+	Uuid              uuid.UUID
+	SigningAddress    common.Address
+	MinTimestamp      uint64
+	MaxTimestamp      uint64
+	RevertingTxHashes []common.Hash
+	Hash              common.Hash
+}
+
+func (b *MevBundle) UniquePayload() []byte {
+	var buf []byte
+	buf = binary.AppendVarint(buf, b.BlockNumber.Int64())
+	buf = append(buf, b.Hash[:]...)
+	sort.Slice(b.RevertingTxHashes, func(i, j int) bool {
+		return bytes.Compare(b.RevertingTxHashes[i][:], b.RevertingTxHashes[j][:]) <= 0
+	})
+	for _, txHash := range b.RevertingTxHashes {
+		buf = append(buf, txHash[:]...)
+	}
+	return buf
+}
+
+func (b *MevBundle) ComputeUUID() uuid.UUID {
+	return uuid.NewHash(sha256.New(), uuid.Nil, b.UniquePayload(), 5)
+}
+
+func (b *MevBundle) RevertingHash(hash common.Hash) bool {
+	for _, revHash := range b.RevertingTxHashes {
+		if revHash == hash {
+			return true
+		}
+	}
+	return false
+}
+
+type SimulatedBundle struct {
+	MevGasPrice       *big.Int
+	TotalEth          *big.Int
+	EthSentToCoinbase *big.Int
+	TotalGasUsed      uint64
+	OriginalBundle    MevBundle
 }
