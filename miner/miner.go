@@ -58,6 +58,7 @@ type Config struct {
 	CommitInterruptFlag bool           // Interrupt commit when time is up ( default = true)
 
 	NewPayloadTimeout time.Duration // The maximum time allowance for creating a new payload
+	MevEndpoint       string
 }
 
 // DefaultConfig contains default settings for miner.
@@ -71,6 +72,7 @@ var DefaultConfig = Config{
 	// run 3 rounds.
 	Recommit:          2 * time.Second,
 	NewPayloadTimeout: 2 * time.Second,
+	MevEndpoint:       "",
 }
 
 // Miner creates blocks and searches for proof-of-work values.

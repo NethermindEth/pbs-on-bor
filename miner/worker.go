@@ -307,6 +307,8 @@ type worker struct {
 	profileCount        *int32 // Global count for profiling
 	interruptCommitFlag bool   // Interrupt commit ( Default true )
 	interruptedTxCache  *vm.TxCache
+
+	builderClient *BuilderClient
 }
 
 //nolint:staticcheck
@@ -380,6 +382,12 @@ func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus
 	}
 
 	worker.newpayloadTimeout = newpayloadTimeout
+
+	bc, err := NewBuilderClient(worker.config.MevEndpoint, 10*time.Second)
+	if err != nil {
+		log.Warn("Failed to create builder client", "err", err)
+	}
+	worker.builderClient = bc
 
 	ctx := tracing.WithTracer(context.Background(), otel.GetTracerProvider().Tracer("MinerWorker"))
 

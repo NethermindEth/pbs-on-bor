@@ -140,6 +140,13 @@ type Config struct {
 
 	// Pprof has the pprof related settings
 	Pprof *PprofConfig `hcl:"pprof,block" toml:"pprof,block"`
+
+	MevConfig *MevConfig `hcl:"mev,block" toml:"mev,block"`
+}
+
+type MevConfig struct {
+	Enabled  bool   `hcl:"enabled,optional" toml:"enabled,optional"`
+	Endpoint string `hcl:"endpoint,optional" toml:"endpoint,optional"`
 }
 
 type LoggingConfig struct {
@@ -787,6 +794,10 @@ func DefaultConfig() *Config {
 			Enable:               true,
 			SpeculativeProcesses: 8,
 		},
+		MevConfig: &MevConfig{
+			Enabled:  false,
+			Endpoint: "localhost:28545",
+		},
 	}
 }
 
@@ -929,9 +940,6 @@ func (c *Config) buildEth(stack *node.Node, accountManager *accounts.Manager) (*
 	// Developer Fake Author for producing blocks without authorisation on bor consensus
 	n.DevFakeAuthor = c.DevFakeAuthor
 
-	// Developer Fake Author for producing blocks without authorisation on bor consensus
-	n.DevFakeAuthor = c.DevFakeAuthor
-
 	// gas price oracle
 	{
 		n.GPO.Blocks = int(c.Gpo.Blocks)
@@ -972,6 +980,10 @@ func (c *Config) buildEth(stack *node.Node, accountManager *accounts.Manager) (*
 			}
 
 			n.Miner.Etherbase = common.HexToAddress(etherbase)
+		}
+
+		if c.MevConfig.Enabled && c.MevConfig.Endpoint != "" {
+			n.Miner.MevEndpoint = c.MevConfig.Endpoint
 		}
 	}
 
