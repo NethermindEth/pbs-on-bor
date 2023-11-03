@@ -24,9 +24,9 @@ cp ./config ${ROOTDIR}/
 6. Run
 ```
 cd ${ROOTDIR}
-./bin/bor --config config/node1_config.toml
+./bin/bor server --config config/node1_config.toml
 # in another terminal:
-./bin/bor --config config/node2_config.toml
+./bin/bbuilder server --config config/node2_builder_config.toml 2>&1 | tee -a run.log
 ```
 
 ## Testing the network

@@ -66,9 +66,9 @@ type CliqueBuilderArgs struct {
 	submissionOffsetFromEndOfSlot time.Duration
 	validator                     *blockvalidation.BlockValidationAPI
 	builderSecretKey              *bls.SecretKey
+	builderBlockResubmitInterval  time.Duration
 	//proposerPubkey                phase0.BLSPubKey
 	//builderSigningDomain          phase0.Domain
-	//builderBlockResubmitInterval  time.Duration
 }
 
 func NewCliqueBuilder(args CliqueBuilderArgs) (*CliqueBuilder, error) {
@@ -86,9 +86,9 @@ func NewCliqueBuilder(args CliqueBuilderArgs) (*CliqueBuilder, error) {
 		args.limiter = rate.NewLimiter(rate.Every(RateLimitIntervalDefault), RateLimitBurstDefault)
 	}
 
-	//if args.builderBlockResubmitInterval == 0 {
-	//	args.builderBlockResubmitInterval = BlockResubmitIntervalDefault
-	//}
+	if args.builderBlockResubmitInterval == 0 {
+		args.builderBlockResubmitInterval = BlockResubmitIntervalDefault
+	}
 
 	if args.submissionOffsetFromEndOfSlot == 0 {
 		args.submissionOffsetFromEndOfSlot = SubmissionOffsetFromEndOfSlotSecondsDefault
@@ -109,9 +109,10 @@ func NewCliqueBuilder(args CliqueBuilderArgs) (*CliqueBuilder, error) {
 		stop:                          make(chan struct{}, 1),
 		builderPublicKey:              builderPublicKey,
 		builderSecretKey:              args.builderSecretKey,
+		builderResubmitInterval:       args.builderBlockResubmitInterval,
+		blockTime:                     8 * time.Second,
 		//proposerPubkey:                args.proposerPubkey,
 		//builderSigningDomain:          args.builderSigningDomain,
-		//builderResubmitInterval:       args.builderBlockResubmitInterval,
 	}, nil
 }
 
@@ -160,8 +161,11 @@ func (cb *CliqueBuilder) onChainHeadEvent(block *types.Block) error {
 	cb.slotCtx = slotCtx
 	cb.slotCtxCancel = slotCtxCancel
 
+	// [pnowosie] nasty hack: I need to tweak the block's timestamp in order to make it pass
+	// see: catalyst/api.go:540 "Invalid timestamp" error
+	blockTime := block.Header().Time + 1
 	attrs := &types.BuilderPayloadAttributes{
-		Timestamp:             hexutil.Uint64(block.Header().Time),
+		Timestamp:             hexutil.Uint64(blockTime),
 		Random:                common.Hash{},    // unused
 		SuggestedFeeRecipient: common.Address{}, // unused
 		Slot:                  block.NumberU64() + 1,
@@ -204,6 +208,7 @@ func (cb *CliqueBuilder) runBuildingJob(slotCtx context.Context, attrs *types.Bu
 			if err != nil {
 				log.Error("could not run sealed block hook", "err", err)
 			} else {
+				log.Info("Queued block for submission", "slot", attrs.Slot, "parent", attrs.HeadHash, "payloadTimestamp", uint64(attrs.Timestamp), "blockHash", queueBestEntry.block.Hash())
 				queueLastSubmittedHash = queueBestEntry.block.Hash()
 			}
 		}
@@ -213,7 +218,7 @@ func (cb *CliqueBuilder) runBuildingJob(slotCtx context.Context, attrs *types.Bu
 	// Avoid submitting early into a given slot. For example if slots have 12 second interval, submissions should
 	// not begin until 8 seconds into the slot.
 	slotTime := time.Unix(int64(attrs.Timestamp), 0).UTC()
-	slotSubmitStartTime := slotTime.Add(-cb.submissionOffsetFromEndOfSlot)
+	slotSubmitStartTime := slotTime.Add(-1 * time.Second)
 
 	// Empties queue, submits the best block for current job with rate limit (global for all jobs)
 	go runResubmitLoop(ctx, cb.limiter, queueSignal, submitBestBlock, slotSubmitStartTime)
@@ -230,6 +235,7 @@ func (cb *CliqueBuilder) runBuildingJob(slotCtx context.Context, attrs *types.Bu
 
 		queueMu.Lock()
 		defer queueMu.Unlock()
+		log.Info("Queue best entry", "slot", attrs.Slot, "parent", attrs.HeadHash, "blockHash", block.Hash(), "best found", queueLastSubmittedHash)
 		if block.Hash() != queueLastSubmittedHash {
 			queueBestEntry = blockQueueEntry{
 				block:           block,

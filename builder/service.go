@@ -28,6 +28,7 @@ const (
 	_PathRegisterValidator = "/eth/v1/builder/validators"
 	_PathGetHeader         = "/eth/v1/builder/header/{slot:[0-9]+}/{parent_hash:0x[a-fA-F0-9]+}/{pubkey:0x[a-fA-F0-9]+}"
 	_PathGetPayload        = "/eth/v1/builder/blinded_blocks"
+	_PathGetBlock          = "/eth/v1/builder/block/{parent_hash:0x[a-fA-F0-9]+}"
 )
 
 type Service struct {
@@ -67,6 +68,7 @@ func getRouter(localRelay *LocalRelay) http.Handler {
 	router.HandleFunc(_PathRegisterValidator, localRelay.handleRegisterValidator).Methods(http.MethodPost)
 	router.HandleFunc(_PathGetHeader, localRelay.handleGetHeader).Methods(http.MethodGet)
 	router.HandleFunc(_PathGetPayload, localRelay.handleGetPayload).Methods(http.MethodPost)
+	router.HandleFunc(_PathGetBlock, localRelay.handleGetBlock).Methods(http.MethodGet)
 
 	// Add logging and return router
 	loggedRouter := httplogger.LoggingMiddleware(router)
@@ -126,6 +128,7 @@ func NewService(listenAddr string, localRelay *LocalRelay, builder IBuilder) *Se
 }
 
 func Register(stack *node.Node, backend *eth.Ethereum, cfg *Config) error {
+	fmt.Println("Builder service is registered")
 	envBuilderSkBytes, err := hexutil.Decode(cfg.BuilderSecretKey)
 	if err != nil {
 		return errors.New("incorrect builder API secret key provided")

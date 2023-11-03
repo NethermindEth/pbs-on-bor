@@ -302,6 +302,41 @@ func (r *LocalRelay) handleGetHeader(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func (r *LocalRelay) handleGetBlock(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	parentHashHex := vars["parent_hash"]
+
+	r.bestDataLock.Lock()
+	bestHeader := r.bestHeader
+	bestPayload := r.bestPayload
+	r.bestDataLock.Unlock()
+
+	if bestHeader == nil || bestPayload == nil {
+		respondError(w, http.StatusBadRequest, "no payloads")
+		return
+	}
+
+	if bestHeader == nil || bestHeader.ParentHash.String() != parentHashHex {
+		respondError(w, http.StatusBadRequest, "unknown payload")
+		return
+	}
+
+	response := &api.VersionedExecutionPayload{
+		Version:   consensusspec.DataVersionBellatrix,
+		Bellatrix: bestPayload,
+	}
+
+	log.Info("sending block", "block", bestPayload.BlockHash.String(), "payload", bestPayload)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		respondError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+}
+
 func (r *LocalRelay) handleGetPayload(w http.ResponseWriter, req *http.Request) {
 	payload := new(apiv1bellatrix.SignedBlindedBeaconBlock)
 	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
