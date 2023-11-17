@@ -1194,6 +1194,16 @@ func (c *Config) buildEth(stack *node.Node, accountManager *accounts.Manager) (*
 		n.DatabaseFreezer = c.Ancient
 	}
 
+	// Builder
+	if c.Builder.Enabled {
+		key := c.Builder.BuilderSecretKey
+		if key, err := crypto.HexToECDSA(strings.TrimPrefix(key, "0x")); err != nil {
+			log.Error("Error parsing builder signing key from builder config", "err", err)
+		} else {
+			n.Miner.BuilderTxSigningKey = key
+		}
+	}
+
 	return &n, nil
 }
 
