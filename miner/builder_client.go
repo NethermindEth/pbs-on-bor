@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"time"
 
@@ -148,13 +149,17 @@ func (res *ExecutionPayloadResponse) getBlock() (*types.Block, error) {
 //	return nil
 //}
 
-func (bc *BuilderClient) GetBlock(parentHash common.Hash) (*types.Block, error) {
+func (bc *BuilderClient) GetBlock(number uint64, parentHash common.Hash) (*types.Block, error) {
 	// /eth/v1/builder/block/:parent_hash
-	part := fmt.Sprintf("/eth/v1/builder/block/%s", parentHash.Hex())
+	part := fmt.Sprintf("/eth/v1/builder/block/%d/%s", number, parentHash.Hex())
 	url := bc.baseURL.JoinPath(part)
 	resp, err := bc.hc.Get(url.String())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("endpoint error: %w [req: %s]", err, part)
+	}
+	if resp.StatusCode >= 400 {
+		b, _ := httputil.DumpResponse(resp, true)
+		return nil, fmt.Errorf("unsuccessful response from endpoint [req: %s]\n%s\n", part, string(b))
 	}
 	defer resp.Body.Close()
 	var response ExecutionPayloadResponse

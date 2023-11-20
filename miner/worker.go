@@ -399,12 +399,14 @@ func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus
 		log.Warn("Failed to create builder client", "err", err)
 	}
 	worker.builderClient = bc
+	log.Info("Builder client set and ready")
 
 	ctx := tracing.WithTracer(context.Background(), otel.GetTracerProvider().Tracer("MinerWorker"))
 
-	worker.wg.Add(4)
+	worker.wg.Add(5)
 
 	go worker.mainLoop(ctx)
+	go worker.newBlockLoop()
 	go worker.newWorkLoop(ctx, recommit)
 	go worker.resultLoop()
 	go worker.taskLoop()
@@ -600,11 +602,12 @@ func (w *worker) newWorkLoop(ctx context.Context, recommit time.Duration) {
 		}
 
 		parent := w.chain.CurrentBlock()
-		block, err := w.builderClient.GetBlock(parent.Hash())
+		block, err := w.builderClient.GetBlock(parent.Number.Uint64(), parent.Hash())
 		if err != nil {
 			log.Error("failed to get block from builder", "err", err)
 			return
 		}
+		log.Info("Got external block", "parent", parent.Hash(), "number", block.Number(), "hash", block.Hash())
 		select {
 		// Note: we don't want to interrupt sealing the external block. Put void interrupt here.
 		case w.newBlockCh <- &newBlockReq{interrupt: builderInterrupt, timestamp: timestamp, block: block}:
@@ -686,6 +689,8 @@ func (w *worker) newWorkLoop(ctx context.Context, recommit time.Duration) {
 // We do define another loop to prevent any race between local block and remote blocks.
 func (w *worker) newBlockLoop() {
 	defer w.wg.Done()
+	clientSet := w.builderClient != nil
+	log.Info("Worker block loop started", "builder client set", clientSet)
 	for {
 		select {
 		case req := <-w.newBlockCh:
