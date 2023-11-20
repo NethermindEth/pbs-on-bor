@@ -179,11 +179,12 @@ func (env *environment) discard() {
 // task contains all information for consensus engine sealing and result submitting.
 type task struct {
 	//nolint:containedctx
-	ctx       context.Context
-	receipts  []*types.Receipt
-	state     *state.StateDB
-	block     *types.Block
-	createdAt time.Time
+	ctx         context.Context
+	receipts    []*types.Receipt
+	state       *state.StateDB
+	block       *types.Block
+	createdAt   time.Time
+	fromBuilder bool
 }
 
 const (
@@ -200,6 +201,14 @@ type newWorkReq struct {
 	interrupt *atomic.Int32
 	noempty   bool
 	timestamp int64
+}
+
+type newBlockReq struct {
+	ctx       context.Context
+	interrupt *atomic.Int32
+	timestamp int64
+	noempty   bool
+	block     *types.Block
 }
 
 // newPayloadResult represents a result struct corresponds to payload generation.
@@ -246,6 +255,7 @@ type worker struct {
 
 	// Channels
 	newWorkCh          chan *newWorkReq
+	newBlockCh         chan *newBlockReq
 	getWorkCh          chan *getWorkReq
 	taskCh             chan *task
 	resultCh           chan *types.Block
@@ -331,6 +341,7 @@ func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus
 		chainHeadCh:         make(chan core.ChainHeadEvent, chainHeadChanSize),
 		chainSideCh:         make(chan core.ChainSideEvent, chainSideChanSize),
 		newWorkCh:           make(chan *newWorkReq),
+		newBlockCh:          make(chan *newBlockReq),
 		getWorkCh:           make(chan *getWorkReq),
 		taskCh:              make(chan *task),
 		resultCh:            make(chan *types.Block, resultQueueSize),
@@ -536,9 +547,10 @@ func (w *worker) newWorkLoop(ctx context.Context, recommit time.Duration) {
 	defer w.wg.Done()
 
 	var (
-		interrupt   *atomic.Int32
-		minRecommit = recommit // minimal resubmit interval specified by user.
-		timestamp   int64      // timestamp for each round of sealing.
+		interrupt        *atomic.Int32
+		builderInterrupt *atomic.Int32
+		minRecommit      = recommit // minimal resubmit interval specified by user.
+		timestamp        int64      // timestamp for each round of sealing.
 	)
 
 	timer := time.NewTimer(0)
@@ -577,6 +589,29 @@ func (w *worker) newWorkLoop(ctx context.Context, recommit time.Duration) {
 		}
 		w.pendingMu.Unlock()
 	}
+	commitBuilder := func(s int32) {
+		if builderInterrupt != nil {
+			builderInterrupt.Store(s)
+		}
+		builderInterrupt = new(atomic.Int32)
+
+		if w.builderClient == nil {
+			return
+		}
+
+		parent := w.chain.CurrentBlock()
+		block, err := w.builderClient.GetBlock(parent.Hash())
+		if err != nil {
+			log.Error("failed to get block from builder", "err", err)
+			return
+		}
+		select {
+		// Note: we don't want to interrupt sealing the external block. Put void interrupt here.
+		case w.newBlockCh <- &newBlockReq{interrupt: builderInterrupt, timestamp: timestamp, block: block}:
+		case <-w.exitCh:
+			return
+		}
+	}
 
 	for {
 		select {
@@ -586,6 +621,7 @@ func (w *worker) newWorkLoop(ctx context.Context, recommit time.Duration) {
 			timestamp = time.Now().Unix()
 
 			commit(false, commitInterruptNewHead)
+			go commitBuilder(commitInterruptNewHead)
 
 		case head := <-w.chainHeadCh:
 			clearPending(head.Block.NumberU64())
@@ -593,6 +629,7 @@ func (w *worker) newWorkLoop(ctx context.Context, recommit time.Duration) {
 			timestamp = time.Now().Unix()
 
 			commit(false, commitInterruptNewHead)
+			go commitBuilder(commitInterruptNewHead)
 
 		case <-timer.C:
 			// If sealing is running resubmit a new work cycle periodically to pull in
@@ -605,6 +642,7 @@ func (w *worker) newWorkLoop(ctx context.Context, recommit time.Duration) {
 				}
 
 				commit(true, commitInterruptResubmit)
+				go commitBuilder(commitInterruptNewHead)
 			}
 
 		case interval := <-w.resubmitIntervalCh:
@@ -644,6 +682,20 @@ func (w *worker) newWorkLoop(ctx context.Context, recommit time.Duration) {
 	}
 }
 
+// builderLoop is response for generating sealing work based on the received block from builder.
+// We do define another loop to prevent any race between local block and remote blocks.
+func (w *worker) newBlockLoop() {
+	defer w.wg.Done()
+	for {
+		select {
+		case req := <-w.newBlockCh:
+			w.commitWork(req.ctx, req.interrupt, req.noempty, req.timestamp, req.block)
+		case <-w.exitCh:
+			return
+		}
+	}
+}
+
 // mainLoop is responsible for generating and submitting sealing work based on
 // the received event. It can support two modes: automatically generate task and
 // submit it or return task according to given parameters for various proposes.
@@ -665,15 +717,17 @@ func (w *worker) mainLoop(ctx context.Context) {
 	for {
 		select {
 		case req := <-w.newWorkCh:
-			if w.chainConfig.ChainID.Cmp(params.BorMainnetChainConfig.ChainID) == 0 || w.chainConfig.ChainID.Cmp(params.MumbaiChainConfig.ChainID) == 0 {
-				if w.eth.PeerCount() > 0 {
-					//nolint:contextcheck
-					w.commitWork(req.ctx, req.interrupt, req.noempty, req.timestamp)
-				}
-			} else {
-				//nolint:contextcheck
-				w.commitWork(req.ctx, req.interrupt, req.noempty, req.timestamp)
-			}
+			w.commitWork(req.ctx, req.interrupt, req.noempty, req.timestamp, nil)
+		//case req := <-w.newWorkCh:
+		//	if w.chainConfig.ChainID.Cmp(params.BorMainnetChainConfig.ChainID) == 0 || w.chainConfig.ChainID.Cmp(params.MumbaiChainConfig.ChainID) == 0 {
+		//		if w.eth.PeerCount() > 0 {
+		//			//nolint:contextcheck
+		//			w.commitWork(req.ctx, req.interrupt, req.noempty, req.timestamp)
+		//		}
+		//	} else {
+		//		//nolint:contextcheck
+		//		w.commitWork(req.ctx, req.interrupt, req.noempty, req.timestamp)
+		//	}
 
 		case req := <-w.getWorkCh:
 			block, fees, err := w.generateWork(req.ctx, req.params)
@@ -702,7 +756,7 @@ func (w *worker) mainLoop(ctx context.Context) {
 			if w.IsRunning() && w.current != nil && len(w.current.uncles) < 2 {
 				start := time.Now()
 				if err := w.commitUncle(w.current, ev.Block.Header()); err == nil {
-					commitErr := w.commit(ctx, w.current.copy(), nil, true, start)
+					commitErr := w.commit(ctx, w.current.copy(), nil, true, start, false)
 					if commitErr != nil {
 						log.Error("error while committing work for mining", "err", commitErr)
 					}
@@ -764,7 +818,7 @@ func (w *worker) mainLoop(ctx context.Context) {
 				// submit sealing work here since all empty submission will be rejected
 				// by clique. Of course the advance sealing(empty submission) is disabled.
 				if w.chainConfig.Clique != nil && w.chainConfig.Clique.Period == 0 {
-					w.commitWork(ctx, nil, true, time.Now().Unix())
+					w.commitWork(ctx, nil, true, time.Now().Unix(), nil)
 				}
 			}
 
@@ -810,6 +864,11 @@ func (w *worker) taskLoop() {
 			// Reject duplicate sealing work due to resubmitting.
 			sealHash := w.engine.SealHash(task.block.Header())
 			if sealHash == prev {
+				continue
+			}
+			if w.hasExternalBlockPendingTask() && !task.fromBuilder {
+				// If there is an task from externally built block, we prefer to keep it.
+				log.Info("External block pending task exists, skip sealing local block", "sealhash", sealHash)
 				continue
 			}
 			// Interrupt previous sealing operation
@@ -1507,9 +1566,15 @@ func startProfiler(profile string, filepath string, number uint64) (func() error
 // be customized with the plugin in the future.
 //
 //nolint:gocognit
-func (w *worker) fillTransactions(ctx context.Context, interrupt *atomic.Int32, env *environment, interruptCtx context.Context) error {
+func (w *worker) fillTransactions(ctx context.Context, interrupt *atomic.Int32, env *environment, block *types.Block, interruptCtx context.Context) error {
 	ctx, span := tracing.StartSpan(ctx, "fillTransactions")
 	defer tracing.EndSpan(span)
+
+	// Use externally ordered transactions if available.
+	if block != nil {
+		log.Info("Using externally ordered transactions", "blockHash", block.Hash())
+		return w.processTransactions(interrupt, env, block.Transactions(), interruptCtx)
+	}
 
 	// Split the pending transactions into locals and remotes
 	// Fill the block with all available pending transactions.
@@ -1680,6 +1745,74 @@ func (w *worker) fillTransactions(ctx context.Context, interrupt *atomic.Int32, 
 	return nil
 }
 
+// Run externally ordered transactions.
+func (w *worker) processTransactions(interrupt *atomic.Int32, env *environment, txs types.Transactions, interruptCtx context.Context) error {
+	gasLimit := env.header.GasLimit
+	if env.gasPool == nil {
+		env.gasPool = new(core.GasPool).AddGas(gasLimit)
+	}
+	var coalescedLogs []*types.Log
+	for _, tx := range txs {
+		// Check interruption signal and abort building if it's fired.
+		if interrupt != nil {
+			if signal := interrupt.Load(); signal != commitInterruptNone {
+				return signalToErr(signal)
+			}
+		}
+
+		// If we don't have enough gas for any further transactions then we're done.
+		if env.gasPool.Gas() < params.TxGas {
+			log.Trace("Not enough gas for further transactions", "have", env.gasPool, "want", params.TxGas)
+			break
+		}
+
+		// Error may be ignored here. The error has already been checked
+		// during transaction acceptance in the transaction pool.
+		from, _ := types.Sender(env.signer, tx)
+
+		if tx.Protected() && !w.chainConfig.IsEIP155(env.header.Number) {
+			log.Trace("Ignoring replay protected transaction", "hash", tx.Hash(), "eip155", w.chainConfig.EIP155Block)
+			continue
+		}
+
+		// Start executing the transaction
+		env.state.SetTxContext(tx.Hash(), env.tcount)
+		logs, err := w.commitTransaction(env, tx, interruptCtx)
+		switch {
+		case errors.Is(err, core.ErrNonceTooLow):
+			// New head notification data race between the transaction pool and miner, shift
+			log.Trace("Skipping transaction with low nonce", "sender", from, "nonce", tx.Nonce())
+
+		case errors.Is(err, nil):
+			// Everything ok, collect the logs and shift in the next transaction from the same account
+			coalescedLogs = append(coalescedLogs, logs...)
+			env.tcount++
+
+		default:
+			// Transaction is regarded as invalid, drop all consecutive transactions from
+			// the same sender because of `nonce-too-high` clause.
+			log.Debug("Transaction failed, account skipped", "hash", tx.Hash(), "err", err)
+		}
+	}
+	if !w.IsRunning() && len(coalescedLogs) > 0 {
+		// We don't push the pendingLogsEvent while we are sealing. The reason is that
+		// when we are sealing, the worker will regenerate a sealing block every 3 seconds.
+		// In order to avoid pushing the repeated pendingLog, we disable the pending log pushing.
+
+		// make a copy, the state caches the logs and these logs get "upgraded" from pending to mined
+		// logs by filling in the block hash when the block was mined by the local miner. This can
+		// cause a race condition if a log was "upgraded" before the PendingLogsEvent is processed.
+		cpy := make([]*types.Log, len(coalescedLogs))
+		for i, l := range coalescedLogs {
+			// TODO: [pnowosie] less magical as in https://github.com/NethermindEth/go-ethereum/pull/1/files#r1328806503
+			cpy[i] = new(types.Log)
+			*cpy[i] = *l
+		}
+		w.pendingLogsFeed.Send(cpy)
+	}
+	return nil
+}
+
 // generateWork generates a sealing block based on the given parameters.
 func (w *worker) generateWork(ctx context.Context, params *generateParams) (*types.Block, *big.Int, error) {
 	work, err := w.prepareWork(params)
@@ -1699,7 +1832,7 @@ func (w *worker) generateWork(ctx context.Context, params *generateParams) (*typ
 		})
 		defer timer.Stop()
 
-		err := w.fillTransactions(ctx, interrupt, work, interruptCtx)
+		err := w.fillTransactions(ctx, interrupt, work, nil, interruptCtx)
 		if errors.Is(err, errBlockInterruptedByTimeout) {
 			log.Warn("Block building is interrupted", "allowance", common.PrettyDuration(w.newpayloadTimeout))
 		}
@@ -1715,7 +1848,7 @@ func (w *worker) generateWork(ctx context.Context, params *generateParams) (*typ
 
 // commitWork generates several new sealing tasks based on the parent block
 // and submit them to the sealer.
-func (w *worker) commitWork(ctx context.Context, interrupt *atomic.Int32, noempty bool, timestamp int64) {
+func (w *worker) commitWork(ctx context.Context, interrupt *atomic.Int32, noempty bool, timestamp int64, block *types.Block) {
 	start := time.Now()
 
 	var (
@@ -1770,10 +1903,10 @@ func (w *worker) commitWork(ctx context.Context, interrupt *atomic.Int32, noempt
 	// Create an empty block based on temporary copied state for
 	// sealing in advance without waiting block execution finished.
 	if !noempty && !w.noempty.Load() {
-		_ = w.commit(ctx, work.copy(), nil, false, start)
+		_ = w.commit(ctx, work.copy(), nil, false, start, false)
 	}
 	// Fill pending transactions from the txpool into the block.
-	err = w.fillTransactions(ctx, interrupt, work, interruptCtx)
+	err = w.fillTransactions(ctx, interrupt, work, block, interruptCtx)
 
 	switch {
 	case err == nil:
@@ -1804,7 +1937,8 @@ func (w *worker) commitWork(ctx context.Context, interrupt *atomic.Int32, noempt
 		return
 	}
 	// Submit the generated block for consensus sealing.
-	_ = w.commit(ctx, work.copy(), w.fullTaskHook, true, start)
+	external := block != nil
+	_ = w.commit(ctx, work.copy(), w.fullTaskHook, true, start, external)
 
 	// Swap out the old work with the new one, terminating any leftover
 	// prefetcher processes in the mean time and starting a new one.
@@ -1840,7 +1974,7 @@ func getInterruptTimer(ctx context.Context, work *environment, current *types.Bl
 // and commits new work if consensus engine is running.
 // Note the assumption is held that the mutation is allowed to the passed env, do
 // the deep copy first.
-func (w *worker) commit(ctx context.Context, env *environment, interval func(), update bool, start time.Time) error {
+func (w *worker) commit(ctx context.Context, env *environment, interval func(), update bool, start time.Time, external bool) error {
 	if w.IsRunning() {
 		ctx, span := tracing.StartSpan(ctx, "commit")
 		defer tracing.EndSpan(span)
@@ -1870,7 +2004,7 @@ func (w *worker) commit(ctx context.Context, env *environment, interval func(), 
 		// If we're post merge, just ignore
 		if !w.isTTDReached(block.Header()) {
 			select {
-			case w.taskCh <- &task{ctx: ctx, receipts: env.receipts, state: env.state, block: block, createdAt: time.Now()}:
+			case w.taskCh <- &task{ctx: ctx, receipts: env.receipts, state: env.state, block: block, createdAt: time.Now(), fromBuilder: external}:
 				w.unconfirmed.Shift(block.NumberU64() - 1)
 
 				fees := totalFees(block, env.receipts)
@@ -1931,6 +2065,18 @@ func (w *worker) getSealingBlock(parent common.Hash, timestamp uint64, coinbase 
 func (w *worker) isTTDReached(header *types.Header) bool {
 	td, ttd := w.chain.GetTd(header.ParentHash, header.Number.Uint64()-1), w.chain.Config().TerminalTotalDifficulty
 	return td != nil && ttd != nil && td.Cmp(ttd) >= 0
+}
+
+// check if there is an externally built block in pendingTasks.
+func (w *worker) hasExternalBlockPendingTask() bool {
+	w.pendingMu.RLock()
+	defer w.pendingMu.RUnlock()
+	for _, task := range w.pendingTasks {
+		if task.fromBuilder {
+			return true
+		}
+	}
+	return false
 }
 
 // copyReceipts makes a deep copy of the given receipts.

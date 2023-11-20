@@ -400,7 +400,7 @@ func (w *worker) mainLoopWithDelay(ctx context.Context, delay uint, opcodeDelay 
 			if w.IsRunning() && w.current != nil && len(w.current.uncles) < 2 {
 				start := time.Now()
 				if err := w.commitUncle(w.current, ev.Block.Header()); err == nil {
-					commitErr := w.commit(ctx, w.current.copy(), nil, true, start)
+					commitErr := w.commit(ctx, w.current.copy(), nil, true, start, false)
 					if commitErr != nil {
 						log.Error("error while committing work for mining", "err", commitErr)
 					}
@@ -456,7 +456,7 @@ func (w *worker) mainLoopWithDelay(ctx context.Context, delay uint, opcodeDelay 
 				// submit sealing work here since all empty submission will be rejected
 				// by clique. Of course the advance sealing(empty submission) is disabled.
 				if w.chainConfig.Clique != nil && w.chainConfig.Clique.Period == 0 {
-					w.commitWork(ctx, nil, true, time.Now().Unix())
+					w.commitWork(ctx, nil, true, time.Now().Unix(), nil)
 				}
 			}
 
@@ -535,7 +535,7 @@ func (w *worker) commitWorkWithDelay(ctx context.Context, interrupt *int32, noem
 	// Create an empty block based on temporary copied state for
 	// sealing in advance without waiting block execution finished.
 	if !noempty && !w.noempty.Load() {
-		err = w.commit(ctx, work.copy(), nil, false, start)
+		err = w.commit(ctx, work.copy(), nil, false, start, false)
 		if err != nil {
 			return
 		}
@@ -544,7 +544,7 @@ func (w *worker) commitWorkWithDelay(ctx context.Context, interrupt *int32, noem
 	// Fill pending transactions from the txpool
 	w.fillTransactionsWithDelay(ctx, interrupt, work, interruptCtx)
 
-	err = w.commit(ctx, work.copy(), w.fullTaskHook, true, start)
+	err = w.commit(ctx, work.copy(), w.fullTaskHook, true, start, false)
 	if err != nil {
 		return
 	}

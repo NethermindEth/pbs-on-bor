@@ -148,7 +148,7 @@ func (res *ExecutionPayloadResponse) getBlock() (*types.Block, error) {
 //	return nil
 //}
 
-func (bc *BuilderClient) GetBlock(slot uint64, parentHash common.Hash) (*types.Block, error) {
+func (bc *BuilderClient) GetBlock(parentHash common.Hash) (*types.Block, error) {
 	// /eth/v1/builder/block/:parent_hash
 	part := fmt.Sprintf("/eth/v1/builder/block/%s", parentHash.Hex())
 	url := bc.baseURL.JoinPath(part)
