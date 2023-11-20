@@ -28,7 +28,7 @@ const (
 	_PathRegisterValidator = "/eth/v1/builder/validators"
 	_PathGetHeader         = "/eth/v1/builder/header/{slot:[0-9]+}/{parent_hash:0x[a-fA-F0-9]+}/{pubkey:0x[a-fA-F0-9]+}"
 	_PathGetPayload        = "/eth/v1/builder/blinded_blocks"
-	_PathGetBlock          = "/eth/v1/builder/block/{parent_hash:0x[a-fA-F0-9]+}"
+	_PathGetBlock          = "/eth/v1/builder/block/{slot:[0-9]+}/{parent_hash:0x[a-fA-F0-9]+}"
 )
 
 type Service struct {

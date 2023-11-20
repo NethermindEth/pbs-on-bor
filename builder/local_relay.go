@@ -311,16 +311,16 @@ func (r *LocalRelay) handleGetBlock(w http.ResponseWriter, req *http.Request) {
 	bestPayload := r.bestPayload
 	r.bestDataLock.Unlock()
 
+	if bestHeader == nil || bestPayload == nil {
+		respondError(w, http.StatusBadRequest, "no payloads")
+		return
+	}
+
 	// TODO: [pnowosie] remove or lower severity
 	log.Info("=================  Req received  ===================", "parent", parentHashHex)
 	header := fmt.Sprintf("Parent : %s\n, BlockNumber : %d\n, BlockHash : %s\n, Timestamp : %d\n",
 		bestHeader.ParentHash, bestHeader.BlockNumber, bestHeader.BlockHash, bestHeader.Timestamp)
 	log.Info("👉 Best Header", "", header)
-
-	if bestHeader == nil || bestPayload == nil {
-		respondError(w, http.StatusBadRequest, "no payloads")
-		return
-	}
 
 	if bestHeader == nil || bestHeader.ParentHash.String() != parentHashHex {
 		respondError(w, http.StatusBadRequest, "unknown payload")
