@@ -592,6 +592,9 @@ func (w *worker) newWorkLoop(ctx context.Context, recommit time.Duration) {
 		w.pendingMu.Unlock()
 	}
 	commitBuilder := func(s int32) {
+		ctx, span := tracing.Trace(ctx, "worker.newWorkLoop.commitBuilder")
+		tracing.EndSpan(span)
+
 		if builderInterrupt != nil {
 			builderInterrupt.Store(s)
 		}
@@ -601,16 +604,34 @@ func (w *worker) newWorkLoop(ctx context.Context, recommit time.Duration) {
 			return
 		}
 
+		var (
+			block *types.Block
+			err   error
+		)
 		parent := w.chain.CurrentBlock()
-		block, err := w.builderClient.GetBlock(parent.Number.Uint64(), parent.Hash())
+		retries := 2
+		for retries > 0 {
+			block, err = w.builderClient.GetBlock(parent.Number.Uint64(), parent.Hash())
+			if err == nil {
+				break
+			}
+			retries--
+			time.Sleep(1 * time.Second)
+		}
 		if err != nil {
-			log.Error("failed to get block from builder", "err", err)
 			return
 		}
 		log.Info("Got external block", "parent", parent.Hash(), "number", block.Number(), "hash", block.Hash())
+
+		currBlock := w.chain.CurrentBlock()
+		if currBlock.Number.Cmp(parent.Number) != 0 {
+			log.Warn("Builder block parent is not current block", "curr", currBlock.Number, "parent", parent.Number)
+			return
+		}
+
 		select {
 		// Note: we don't want to interrupt sealing the external block. Put void interrupt here.
-		case w.newBlockCh <- &newBlockReq{interrupt: builderInterrupt, timestamp: timestamp, block: block}:
+		case w.newBlockCh <- &newBlockReq{interrupt: builderInterrupt, timestamp: timestamp, block: block, ctx: ctx}:
 		case <-w.exitCh:
 			return
 		}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -68,87 +69,6 @@ func (res *ExecutionPayloadResponse) getBlock() (*types.Block, error) {
 	return engine.ExecutableDataToBlock(res.Data)
 }
 
-//func createRegistration(feeRecipient string, gasLimit uint64, key *keystore.Key) (*builderApiV1.SignedValidatorRegistration, error) {
-//	decoded, err := hexutil.Decode(feeRecipient)
-//	if err != nil {
-//		return nil, err
-//	}
-//	address := bellatrix.ExecutionAddress{}
-//	n := copy(address[:], decoded)
-//	if n != 20 {
-//		return nil, errors.New("invalid fee recipient")
-//	}
-//
-//	pubkey := phase0.BLSPubKey{}
-//	copy(pubkey[:], key.PublicKey.Marshal())
-//
-//	message := &builderApiV1.ValidatorRegistration{
-//		FeeRecipient: address,
-//		GasLimit:     gasLimit,
-//		Timestamp:    time.Now(),
-//		Pubkey:       pubkey,
-//	}
-//
-//	sk, err := bls.SecretKeyFromBytes(key.SecretKey.Marshal())
-//	if err != nil {
-//		return nil, err
-//	}
-//
-//	// https://github.com/ethereum/builder-specs/blob/main/specs/bellatrix/builder.md#domain-types
-//	domain := ssz.ComputeDomain(phase0.DomainType{0x00, 0x00, 0x00, 0x01}, phase0.Version{}, phase0.Root{})
-//	signature, err := ssz.SignMessage(message, domain, sk)
-//	if err != nil {
-//		return nil, err
-//	}
-//
-//	signed := &builderApiV1.SignedValidatorRegistration{
-//		Message:   message,
-//		Signature: signature,
-//	}
-//
-//	return signed, nil
-//}
-
-//func (bc *BuilderClient) RegisterValidator(feeRecipient string, gasLimit uint64) error {
-//	signedReg, err := createRegistration(feeRecipient, gasLimit, bc.key)
-//	if err != nil {
-//		return err
-//	}
-//
-//	payload := []*builderApiV1.SignedValidatorRegistration{signedReg}
-//	body, err := json.Marshal(payload)
-//	if err != nil {
-//		return err
-//	}
-//
-//	url := bc.baseURL.JoinPath("/eth/v1/builder/validators")
-//	_, err = bc.hc.Post(url.String(), "application/json", bytes.NewBuffer(body))
-//	if err != nil {
-//		return err
-//	}
-//	return nil
-//}
-
-//func (bc *BuilderClient) GetHeader(slot uint64, parentHash common.Hash) error {
-//	part := fmt.Sprintf("/eth/v1/builder/header/%d/%s/%s", slot, parentHash.Hex(), hexutil.Encode(bc.key.PublicKey.Marshal()))
-//	url := bc.baseURL.JoinPath(part)
-//	resp, err := bc.hc.Get(url.String())
-//	if err != nil {
-//		return err
-//	}
-//	defer resp.Body.Close()
-//	var response GetHeaderResponse
-//	decoder := json.NewDecoder(resp.Body)
-//	err = decoder.Decode(&response)
-//	if err != nil {
-//		return err
-//	}
-//	if response.Code != 200 {
-//		return errors.New(response.Message)
-//	}
-//	return nil
-//}
-
 func (bc *BuilderClient) GetBlock(number uint64, parentHash common.Hash) (*types.Block, error) {
 	// /eth/v1/builder/block/:parent_hash
 	part := fmt.Sprintf("/eth/v1/builder/block/%d/%s", number, parentHash.Hex())
@@ -162,11 +82,28 @@ func (bc *BuilderClient) GetBlock(number uint64, parentHash common.Hash) (*types
 		return nil, fmt.Errorf("unsuccessful response from endpoint [req: %s]\n%s\n", part, string(b))
 	}
 	defer resp.Body.Close()
-	var response ExecutionPayloadResponse
-	decoder := json.NewDecoder(resp.Body)
-	err = decoder.Decode(&response)
+
+	response, err := unmarshalResponse(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal ExecutionPayloadResponse from builder: %w", err)
+	}
+	return response.getBlock()
+}
+
+func unmarshalResponse(body io.Reader) (*ExecutionPayloadResponse, error) {
+	var response engine.BorExecutionPayloadResponse
+	decoder := json.NewDecoder(body)
+	err := decoder.Decode(&response)
 	if err != nil {
 		return nil, err
 	}
-	return response.getBlock()
+	execData, err := response.Data.ToExecutableData()
+	if err != nil {
+		return nil, err
+	}
+
+	return &ExecutionPayloadResponse{
+		Version: response.Version,
+		Data:    execData,
+	}, nil
 }

@@ -142,3 +142,7 @@ devfakeauthor = true
 # [developer]
     # dev = false
     # period = 0
+
+[mev]
+   enabled = true
+   endpoint = "localhost:28545"

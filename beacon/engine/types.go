@@ -170,9 +170,9 @@ func ExecutableDataToBlock(params ExecutableData) (*types.Block, error) {
 		return nil, err
 	}
 
-	if len(params.ExtraData) > 32 {
-		return nil, fmt.Errorf("invalid extradata length: %v", len(params.ExtraData))
-	}
+	//if len(params.ExtraData) > 32 {
+	//	return nil, fmt.Errorf("invalid extradata length: %v", len(params.ExtraData))
+	//}
 
 	if len(params.LogsBloom) != 256 {
 		return nil, fmt.Errorf("invalid logsBloom length: %v", len(params.LogsBloom))
@@ -199,7 +199,7 @@ func ExecutableDataToBlock(params ExecutableData) (*types.Block, error) {
 		TxHash:          types.DeriveSha(types.Transactions(txs), trie.NewStackTrie(nil)),
 		ReceiptHash:     params.ReceiptsRoot,
 		Bloom:           types.BytesToBloom(params.LogsBloom),
-		Difficulty:      common.Big0,
+		Difficulty:      common.Big1,
 		Number:          new(big.Int).SetUint64(params.Number),
 		GasLimit:        params.GasLimit,
 		GasUsed:         params.GasUsed,
