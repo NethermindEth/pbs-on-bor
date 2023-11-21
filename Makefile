@@ -31,7 +31,7 @@ bor:
 
 builder:
 	mkdir -p $(GOPATH)/bin/
-	go build -o $(GOBIN)/bbuilder $(GO_LDFLAGS) ./cmd/cli/main.go
+	go build -o $(GOBIN)/builder $(GO_LDFLAGS) ./cmd/cli/main.go
 	#cp $(GOBIN)/bor $(GOPATH)/bin/
 	@echo "Done building."
 
