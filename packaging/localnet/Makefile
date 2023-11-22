@@ -7,7 +7,7 @@ wipe:
 	rm -rf data/node_?
 
 wipe-logs:
-	rm logs/run?.log
+	rm -f logs/node*.log
 
 clear-term:
 	@clear
@@ -19,11 +19,11 @@ start2: clear-term
 	bin/builder server --config config/node2_config.toml 2>&1 | tee -a "logs/node2-${LOGTS}.log"
 
 wipe-bins:
-	rm bin/*
+	rm -f bin/*
 
 TARGETDIR   := build/bin
-BORDIR     := ../bor-on-bor
-BUILDERDIR := ../pbs-on-bor
+BORDIR     := ../bor-proposer
+BUILDERDIR := ../bor-builder
 bins:
 	cd ${BORDIR} && make bor && cp ./${TARGETDIR}/bor ../localnet/bin
 	cd ${BUILDERDIR} && make builder && cp ./${TARGETDIR}/builder ../localnet/bin
